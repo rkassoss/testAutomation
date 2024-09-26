@@ -1,0 +1,262 @@
+///$tab Environment setup
+// Get Environment and link corresponding Adhoc document chaining - START
+SET NumericalAbbreviation='3:k;6:M;9:B;12:T;15:P;18:E;21:Z;24:Y;-3:m;-6:μ;-9:n;-12:p;-15:f;-18:a;-21:z;-24:y';
+
+LET vCurrSpaceName	=	Upper(GetSysAttr('spaceName'));
+ LET vCurrSpaceName	=	'MERCER~EAS~PROD~SOLUTIONS';  	// OVERRIDE //
+
+let v_Qlik_Env		=	if(SubStringCount(vCurrSpaceName, 'MERCER~EAS~DEV')		, 'DEV',
+            			if(SubStringCount(vCurrSpaceName, 'MERCER~EAS~MQA')		, 'MQA',
+                  		if(SubStringCount(vCurrSpaceName, 'MERCER~EAS~PROD')	, 'PROD', 'DEV'		)));
+
+let v_User_Space	=	if(SubStringCount(vCurrSpaceName, 'CONFIRMATION')		, 'Confirmation', 'EndUsers'		);
+
+
+$(Must_Include=lib://Mercer~EAS~$(v_Qlik_Env)~Data:DataFiles/Data_Connections.qvs);
+$(Must_Include=lib://Mercer~EAS~$(v_Qlik_Env)~Data:DataFiles/App_Links_n_IDs_UTIL.qvs);
+
+
+LIB CONNECT TO '$(vAthenaConnector)';
+LIB CONNECT TO '$(vMIdeasConnector)';
+LIB CONNECT TO '$(vMongoDBConnector)';
+///$tab Variables
+Let v_QVD_Path_Dims_Security	= '$(vQVDConnector)HRL_DIMS_';
+Let v_QVD_Path_Dims_Calendar 	= '$(vQVDConnector)WnM_DIMS_';
+
+let v_User_Space	=	if(SubStringCount(vCurrSpaceName, 'CONFIRMATION')		, 'Confirmation', 'EndUsers'		);
+
+if match(v_User_Space, 'Confirmation') then
+
+	set v_where_month_dim			= '1=1';
+	set v_where_week_dim			= '1=1';
+    Let v_QVD_Path_Dims 			= '$(vQVDConnector)WKL_DIMS_';    
+    Let v_QVD_Path_WKL_FCTS_UTL		= '$(vQVDConnector)WKL_FCTS_UTL_';
+    Let v_QVD_Path_MTH_FCTS_UTL		= '$(vQVDConnector)MTH_FCTS_UTL_';
+    
+elseif match(v_User_Space, 'EndUsers') then
+
+	set v_where_month_dim			= 'util_confirm_flag=1';
+	set v_where_week_dim			= 'util_confirm_flag=1 or last_week_in_month=0';
+    Let v_QVD_Path_Dims 			= '$(vQVDConnector)WKL_DIMS_C_';    
+    Let v_QVD_Path_WKL_FCTS_UTL		= '$(vQVDConnector)WKL_FCTS_UTL_C_';
+    Let v_QVD_Path_MTH_FCTS_UTL		= '$(vQVDConnector)MTH_FCTS_UTL_C_';
+
+end if
+
+trace 'Confirmation Team Month 	: $(v_where_month_dim)';
+trace 'Confirmation Team Week 	: $(v_where_week_dim)';
+trace 'End User UTIL Month		: $(v_where_month_dim_util)';
+trace 'End User UTIL Week		: $(v_where_week_dim_util)';
+trace 'End User TEC Week		: $(v_where_week_dim_tec)';
+trace 'End User RnP Month		: $(v_where_month_dim_RnP)';
+
+
+
+
+
+///$tab dim month
+dim_month_vw:
+// Left Keep(ChargeBasis)
+LOAD Distinct
+    month_key,
+    Date(Date#(month_key,'YYYYMM'),'DD-MMM-YYYY') as Date,
+    Num(Date(Date#(month_key,'YYYYMM'),'DD-MMM-YYYY')) as DateNum,
+    //Dual(month_desc,month_key) as Month,					//KF-20828
+    dual(month_desc, -month_key) as Month,			//KF-20828 in front-en, sorting ascending numeric
+    Dual(TexT(Date(Date#(month_key,'YYYYMM'),'MMM')), Mod(month_key,100)) as Month2,
+    year_key as Year,
+    month_in_ytd as month_in_YTD,
+    month_in_qtd as month_in_QTD,
+    month_in_mtd as month_in_MTD,
+    util_confirm_flag
+//     as_of_date
+FROM [$(v_QVD_Path_Dims_Calendar)dim_month_vw.qvd](qvd);
+// where month_key >= ((Year(today())-5)*100);
+
+
+
+
+
+
+///$tab Fact
+// Phase2: KF-25582, KF-21137 -  START
+
+ChargeBasis:
+Right Keep(dim_month_vw)
+LOAD
+	office_key & '|' & department_key 		as office_department_key,
+	week_key								as [Week],
+	month_key,
+    employee_key,
+    period_type_key							as [Period Type],
+    employee_key & month_key 				as employee_month_key,
+    dual(
+    	if(career_level='UG/Temporary','UG',career_level) 
+        ,
+        if(career_level='UG/Temporary',  ord(left(career_level, 1))-85,  ord(left(career_level, 1))-65+1)
+	)
+    
+    										as [Career Level],  
+    office_key,    
+    department_key,
+    engagement_type_code					as [Charge Basis],		
+    util_client_group_key,		
+
+   // util_clie_grp_charge_amt_gbl			as [Util Client Group Charges],	
+    util_client_group_hours					as [Util Client Group Hours] 
+
+from [$(v_QVD_Path_WKL_FCTS_UTL)agg_empl_utilization_weekly_vw.qvd](qvd) where month_key > 202406;
+// where Exists(month_key);
+
+
+
+
+[Client Groups]:
+load 
+	util_client_group_key,
+    dual(util_client_group_name, util_clie_group_display_order) as [Utilization Client Group]
+from [$(v_QVD_Path_Dims)dim_util_client_group_vw.qvd](qvd);
+// Phase2: KF-25582, KF-21137 -  END
+
+
+
+
+inner Join (ChargeBasis)
+LOAD Distinct
+    office_key as office_key
+FROM [$(v_QVD_Path_Dims)dim_geography_hierarchy_vw.qvd]
+(qvd) where not company_name like '*WW01*';
+
+///$tab Practice Hierarchy
+Left keep(ChargeBasis)
+Practice:
+LOAD Distinct
+    department_key as department_key,
+    department_number as [Department Number],
+    '(' & department_number & ') ' & department_name as [Department],
+    [Department Rollup Name],
+//     department_full_name,
+//     department_rollup_key,
+//     department_rollup_code,
+//     department_rollup_name  as [Employee Sub Sub Practice] ,
+//     department_rollup_order,
+//     sub_practice_key,
+//     sub_practice_code,
+    sub_practice_name as [Sub Practice],
+	practice_key as [Practice Key],					// Phase2: KF-25582, KF-21137
+//     practice_code,
+    [Practice],
+    practice_rollup_name as [Practice Rollup],
+//     practice_order,
+//     sub_practice_rollup_key,
+//     sub_practice_rollup_code,
+	sub_practice_rollup_name as [Sub Practice Rollup]		// TEMP Phase2: KF-25582, KF-21137
+//     sub_practice_rollup_order,
+//     as_of_date
+FROM [$(v_QVD_Path_Dims)dim_practice_hierarchy_vw.qvd](qvd);
+
+
+
+///$tab Geo  hierarchy
+Left keep (ChargeBasis)
+[Geography Hierarchy]:
+LOAD Distinct
+	division_name &'_'& region_name &'_'& zone_name &'_'& country_name &'_'& sub_zone_name as KEY,
+    office_key as office_key,
+    office_name as [Office],
+    company_name as [Company],
+    company_key & '-' & company_name as [Company Code],
+    office_rollup_name as [Office Rollup],
+    sub_zone_name as [Sub Zone],
+    country_name as [Country Territory],
+    zone_name as [Zone],
+    [Region],
+    [Division]
+
+FROM [$(v_QVD_Path_Dims)dim_geography_hierarchy_vw.qvd]
+(qvd) where not company_name like '*WW01*';
+
+
+
+
+
+///$tab employee mnthly
+// Left keep(ChargeBasis)
+[Employee mnthly Analytics]:
+LOAD
+	EMPLOYEE_KEY & MONTH_KEY as employee_month_key,
+    CONSULTANT_FLAG as [Billable (Y/N)],    
+    //FIRST_NAME & ' ' & LAST_NAME & ' [' & HR_EMPLOYEE_NUMBER & ']' 
+    null() as [Employee Name],
+//     full_time_equivalent as [Employee FTE],
+    //HR_EMPLOYEE_NUMBER 
+    null() as [Employee HR Number],
+    WORKFORCE_COUNTER as Workforce,
+    HEADCOUNT_COUNTER as Headcount,
+    EMPLOYEE_STATUS as [Employee Status]
+FROM [$(v_QVD_Path_Dims)DIM_EMPLOYEE_MTHLY_ANALYTICS.qvd](qvd)
+where Exists(employee_month_key,EMPLOYEE_KEY & MONTH_KEY);
+
+
+///$tab Confirmation Code
+//Confirmation Code
+
+LIB CONNECT TO '$(vMIdeasConnector)'; // KF-29721
+
+inner join (ChargeBasis)
+
+// KF-29721 changes start
+
+Load WEEK_KEY as [Week];
+SQL SELECT DISTINCT WEEK_KEY
+FROM DW_RPT.DIM_WEEK
+where $(v_where_week_dim);
+
+// LOAD Distinct week_key as [Week]
+// FROM [$(v_QVD_Path_Dims_Calendar)dim_week_vw.qvd](qvd)
+// where $(v_where_week_dim);
+
+// KF-29721 changes end
+
+
+//Confirmation Code Ends Here
+
+///$tab Dim Week
+Week:
+Left Keep(ChargeBasis)
+LOAD
+    week_key									as [Week],
+    month_key 									as month_key_dim_week,
+    week_number_in_year							as [Week Number In Year],
+    Dual(Date(end_date,'DD-MMM-YYYY'),-end_date) as [Week End Date],
+    util_confirm_flag  							as util_confirm_flag_week,
+    last_week_in_month							as last_week_in_month
+FROM [$(v_QVD_Path_Dims_Calendar)dim_week_vw.qvd](qvd);
+
+
+///$tab Section Access
+// Section Access;
+
+// Section_Access:
+// LOAD
+//     "ACCESS",
+//     USER.EMAIL,
+//     RLS_KEY
+// FROM [$(v_QVD_Path_Dims_Security)Section_Access.qvd](qvd);
+
+
+// Section Application;
+
+
+
+// SecurityBridge:
+// LOAD
+//     RLS_Bridge_KEY,
+//     RLS_KEY
+// FROM [$(v_QVD_Path_Dims_Security)SecurityBridge.qvd](qvd);
+
+// Left Join (ChargeBasis)
+// LOAD
+//     RLS_Bridge_KEY,
+//     office_department_key
+// FROM [$(v_QVD_Path_Dims_Security)RLS_Bridge_OFC_DEPT.qvd](qvd);
